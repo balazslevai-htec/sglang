@@ -142,6 +142,10 @@ from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
+from sglang.srt.managers.triton_preload import (
+    SchedulerTritonPreloadMixin,
+    preload_kernels
+)
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
@@ -262,6 +266,14 @@ class GenerationBatchResult:
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
 
+ENABLE_TRACING_RPD=bool(int(os.getenv("ENABLE_TRACING_RPD", 0)))
+ENABLE_TRACING_PYTORCH=bool(int(os.getenv("ENABLE_TRACING_PYTORCH", 0)))
+SGLANG_TORCH_PROFILER_STEPS_NUM=int(os.getenv("SGLANG_TORCH_PROFILER_STEPS_NUM", 5000))
+SGLANG_TORCH_PROFILER_START_OFFSET=int(os.getenv("SGLANG_TORCH_PROFILER_START_OFFSET", 1000))
+SGLANG_TORCH_PROFILER_PROFILE_ID=os.getenv("SGLANG_TORCH_PROFILER_PROFILE_ID", "torch_prof")
+SGLANG_TORCH_PROFILER_WITH_STACK=bool(os.getenv("SGLANG_TORCH_PROFILER_WITH_STACK", 1))
+SGLANG_TORCH_PROFILER_RECORD_SHAPE=bool(os.getenv("SGLANG_TORCH_PROFILER_START_OFFSET", 0))
+SGLANG_TORCH_PROFILER_STAGE_PROFILE=bool(os.getenv("SGLANG_TORCH_PROFILER_STAGE_PROFILE", 0))
 
 class Scheduler(
     SchedulerOutputProcessorMixin,
@@ -270,6 +282,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerTritonPreloadMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -602,6 +615,10 @@ class Scheduler(
         )
         self.offload_tags = set()
         self.init_profiler()
+        if ENABLE_TRACING_PYTORCH:
+            self.init_profile(None, SGLANG_TORCH_PROFILER_START_OFFSET, SGLANG_TORCH_PROFILER_STEPS_NUM,
+                              ["CPU","GPU"], SGLANG_TORCH_PROFILER_RECORD_SHAPE, SGLANG_TORCH_PROFILER_WITH_STACK,
+                              SGLANG_TORCH_PROFILER_STAGE_PROFILE, SGLANG_TORCH_PROFILER_PROFILE_ID)
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
         self.input_blocker = (
@@ -978,9 +995,19 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        self.start_recording()
+        steps = 0
+        if ENABLE_TRACING_PYTORCH:
+            self.start_profile()
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            from rpdTracerControl import rpdTracerControl
+            rpd = rpdTracerControl()
+            if ENABLE_TRACING_RPD:
+                rpd.start()
+                rpd.rangePush("python", "event_loop_normal", "")
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -991,14 +1018,24 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+            if ENABLE_TRACING_RPD:
+                rpd.rangePop()
+                rpd.stop()
 
             self.last_batch = batch
+            self.save_recording()
+            steps += 1
+            if ENABLE_TRACING_PYTORCH and steps >= SGLANG_TORCH_PROFILER_STEPS_NUM:
+                self.stop_profile()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
-
+        self.start_recording()
+        steps = 0
+        if ENABLE_TRACING_PYTORCH:
+            self.start_profile()
         while True:
             self.launch_last_batch_sample_if_needed()
 
@@ -1007,6 +1044,11 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            from rpdTracerControl import rpdTracerControl
+            rpd = rpdTracerControl()
+            if ENABLE_TRACING_RPD:
+                rpd.start()
+                rpd.rangePush("python", "event_loop_overlap", "")
 
             if batch:
                 result = self.run_batch(batch)
@@ -1019,8 +1061,16 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+            if ENABLE_TRACING_RPD:
+                rpd.rangePop()
+                rpd.stop()
 
             self.last_batch = batch
+            self.save_recording()
+            steps += 1
+            if ENABLE_TRACING_PYTORCH and steps >= SGLANG_TORCH_PROFILER_STEPS_NUM:
+                self.stop_profile()
+
 
     @DynamicGradMode()
     def event_loop_pp(self):
@@ -2933,6 +2983,7 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
+        #preload_kernels()
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2940,7 +2991,11 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-
+        from rpdTracerControl import rpdTracerControl
+        rpd = rpdTracerControl()
+        if ENABLE_TRACING_RPD:
+            rpd.start()
+            rpd.rangePush("python", "scheduler_proc", "")
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
             if server_args.pp_size > 1:
@@ -2963,6 +3018,9 @@ def run_scheduler_process(
                 scheduler.event_loop_overlap_disagg_decode()
             else:
                 scheduler.event_loop_normal_disagg_decode()
+        if ENABLE_TRACING_RPD:
+            rpd.rangePop()
+            rpd.stop()
 
     except Exception:
         traceback = get_exception_traceback()
