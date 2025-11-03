@@ -2983,7 +2983,7 @@ def run_scheduler_process(
             pp_rank,
             dp_rank,
         )
-        #preload_kernels()
+        preload_kernels()
         pipe_writer.send(
             {
                 "status": "ready",
