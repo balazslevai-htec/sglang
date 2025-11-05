@@ -996,9 +996,6 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         self.start_recording()
-        steps = 0
-        if ENABLE_TRACING_PYTORCH:
-            self.start_profile()
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1024,18 +1021,12 @@ class Scheduler(
 
             self.last_batch = batch
             self.save_recording()
-            steps += 1
-            if ENABLE_TRACING_PYTORCH and steps >= SGLANG_TORCH_PROFILER_STEPS_NUM:
-                self.stop_profile()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
         self.start_recording()
-        steps = 0
-        if ENABLE_TRACING_PYTORCH:
-            self.start_profile()
         while True:
             self.launch_last_batch_sample_if_needed()
 
@@ -1067,9 +1058,6 @@ class Scheduler(
 
             self.last_batch = batch
             self.save_recording()
-            steps += 1
-            if ENABLE_TRACING_PYTORCH and steps >= SGLANG_TORCH_PROFILER_STEPS_NUM:
-                self.stop_profile()
 
 
     @DynamicGradMode()
