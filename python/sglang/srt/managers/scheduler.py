@@ -615,9 +615,17 @@ class Scheduler(
         )
         self.offload_tags = set()
         self.init_profiler()
+
+        activities = []
         if ENABLE_TRACING_PYTORCH:
+            activities.extend(["CPU", "GPU"])
+
+        if ENABLE_TRACING_RPD:
+            activities.append("RPD")
+
+        if activities:
             self.init_profile(None, SGLANG_TORCH_PROFILER_START_OFFSET, SGLANG_TORCH_PROFILER_STEPS_NUM,
-                              ["CPU","GPU"], SGLANG_TORCH_PROFILER_RECORD_SHAPE, SGLANG_TORCH_PROFILER_WITH_STACK,
+                              activities, SGLANG_TORCH_PROFILER_RECORD_SHAPE, SGLANG_TORCH_PROFILER_WITH_STACK,
                               SGLANG_TORCH_PROFILER_STAGE_PROFILE, SGLANG_TORCH_PROFILER_PROFILE_ID)
 
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(server_args)
@@ -1000,12 +1008,6 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
-            from rpdTracerControl import rpdTracerControl
-            rpd = rpdTracerControl()
-            if ENABLE_TRACING_RPD:
-                rpd.start()
-                rpd.rangePush("python", "event_loop_normal", "")
-
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -1015,9 +1017,6 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
-            if ENABLE_TRACING_RPD:
-                rpd.rangePop()
-                rpd.stop()
 
             self.last_batch = batch
             self.save_recording()
@@ -1035,11 +1034,6 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            from rpdTracerControl import rpdTracerControl
-            rpd = rpdTracerControl()
-            if ENABLE_TRACING_RPD:
-                rpd.start()
-                rpd.rangePush("python", "event_loop_overlap", "")
 
             if batch:
                 result = self.run_batch(batch)
@@ -1052,9 +1046,6 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
-            if ENABLE_TRACING_RPD:
-                rpd.rangePop()
-                rpd.stop()
 
             self.last_batch = batch
             self.save_recording()
@@ -2979,11 +2970,7 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        from rpdTracerControl import rpdTracerControl
-        rpd = rpdTracerControl()
-        if ENABLE_TRACING_RPD:
-            rpd.start()
-            rpd.rangePush("python", "scheduler_proc", "")
+
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
         if disaggregation_mode == DisaggregationMode.NULL:
             if server_args.pp_size > 1:
@@ -3006,9 +2993,6 @@ def run_scheduler_process(
                 scheduler.event_loop_overlap_disagg_decode()
             else:
                 scheduler.event_loop_normal_disagg_decode()
-        if ENABLE_TRACING_RPD:
-            rpd.rangePop()
-            rpd.stop()
 
     except Exception:
         traceback = get_exception_traceback()
